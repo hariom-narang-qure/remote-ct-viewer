@@ -47,7 +47,11 @@ In the viewer, scroll to change slices, right-drag to adjust window/level, and c
 by linking it into your skills folder, from the repo root:
 
 ```bash
-mkdir -p ~/.claude/skills && ln -sfn "$(pwd)/skills/remote-ct-viewer" ~/.claude/skills/remote-ct-viewer
+SRC="$(pwd)/skills/remote-ct-viewer"
+[ -f "$SRC/SKILL.md" ] || { echo "SKILL.md not found in $SRC"; exit 1; }
+mkdir -p ~/.claude/skills && ln -sfn "$SRC" ~/.claude/skills/remote-ct-viewer
 ```
 
 The skill finds the repo through this link, so keep the repo where it is (or run the command again after you move it).
+
+
