@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+server.log
+# Cases hold patient scans; keep them out of git. The small synthetic example stays.
+cases/*
+!cases/example/

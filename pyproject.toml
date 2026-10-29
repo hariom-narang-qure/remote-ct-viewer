@@ -1,0 +1,13 @@
+[project]
+name = "remote-ct-viewer"
+version = "0.1.0"
+description = "Minimal NiiVue viewer for CT scans with label-map overlays"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    # Used by dump_case.py to convert inputs into the case layout.
+    "nibabel>=5.0",
+    "numpy>=1.26",
+    "SimpleITK>=2.3",
+]

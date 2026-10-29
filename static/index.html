@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>remote-ct-viewer</title>
+<style>
+  :root { --bg: #111; --panel: #1b1b1b; --line: #2c2c2c; --text: #ddd; --muted: #888; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+               font: 13px/1.4 system-ui, sans-serif; }
+  body { display: flex; }
+  aside { width: 240px; flex: none; padding: 12px; background: var(--panel);
+          border-right: 1px solid var(--line); overflow-y: auto; }
+  main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #viewer { flex: 1; min-height: 0; }
+  #status { padding: 6px 12px; border-top: 1px solid var(--line); color: var(--muted);
+            font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; }
+  h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+       margin: 16px 0 6px; }
+  h2:first-child { margin-top: 0; }
+  select, input { width: 100%; }
+  select, #open { background: #222; color: var(--text); border: 1px solid var(--line); padding: 4px; }
+  #open-error { color: #e66; }
+  .row { display: flex; gap: 4px; flex-wrap: wrap; }
+  button { background: #262626; color: var(--text); border: 1px solid var(--line);
+           padding: 4px 8px; cursor: pointer; }
+  button.on { border-color: #888; background: #333; }
+  label.mask { display: flex; align-items: center; gap: 6px; padding: 2px 0; cursor: pointer; }
+  .swatch { width: 12px; height: 12px; border-radius: 2px; flex: none; }
+  .muted { color: var(--muted); }
+</style>
+</head>
+<body>
+<aside>
+  <h2>Open case</h2>
+  <input id="open" placeholder="Paste case name, Enter" autocomplete="off" spellcheck="false">
+  <div id="open-error" class="muted"></div>
+
+  <h2>Case</h2>
+  <select id="case"></select>
+
+  <h2>View</h2>
+  <div class="row" id="views">
+    <button data-view="0">Axial</button>
+    <button data-view="1">Coronal</button>
+    <button data-view="2">Sagittal</button>
+    <button data-view="3" class="on">MPR</button>
+    <button data-view="4">3D</button>
+  </div>
+
+  <h2>Window</h2>
+  <select id="window">
+    <option value="-1350,150">Lung (W1500 L-600)</option>
+    <option value="-160,240">Soft tissue (W400 L40)</option>
+    <option value="-500,1300">Bone (W1800 L400)</option>
+  </select>
+  <div class="muted">Right-drag to adjust.</div>
+
+  <h2>Masks</h2>
+  <div id="masks" class="muted">No mask</div>
+  <div class="row" id="mask-actions" hidden>
+    <button id="all">All</button><button id="none">None</button>
+  </div>
+  <h2>Opacity</h2>
+  <input type="range" id="opacity" min="0" max="1" step="0.05" value="0.5">
+</aside>
+<main>
+  <canvas id="viewer"></canvas>
+  <div id="status">&nbsp;</div>
+</main>
+
+<script type="module">
+import { Niivue } from "https://unpkg.com/@niivue/niivue@0.57.0/dist/index.js";
+
+// Label colours are assigned by label id (not list position) so a label keeps its colour across cases.
+const PALETTE = [
+  [230, 25, 75], [60, 180, 75], [255, 225, 25], [0, 130, 200], [245, 130, 48],
+  [145, 30, 180], [70, 240, 240], [240, 50, 230], [210, 245, 60], [250, 190, 212],
+];
+const SCAN = 0, MASK = 1;
+
+const $ = (id) => document.getElementById(id);
+const nv = new Niivue({ backColor: [0, 0, 0, 1], show3Dcrosshair: true, isRadiologicalConvention: true });
+await nv.attachTo("viewer");
+nv.setSliceType(nv.sliceTypeMultiplanar);
+
+let labels = {};          // {"1": "liver", ...}: mask-meta.json names plus ids found in the mask
+let visible = new Set();  // label ids currently shown
+
+const colorFor = (id) => PALETTE[(id - 1) % PALETTE.length];
+const rgb = ([r, g, b]) => `rgb(${r},${g},${b})`;
+const windowRange = () => $("window").value.split(",").map(Number);
+const hasMask = () => nv.volumes.length > MASK;
+
+// NiiVue draws a volume as a label map once it has a label LUT. Hiding a label = alpha 0 in the LUT.
+function buildLabelLut() {
+  const lut = { R: [0], G: [0], B: [0], A: [0], I: [0], labels: [""] };
+  for (const key of Object.keys(labels)) {
+    const id = Number(key);
+    const [r, g, b] = colorFor(id);
+    lut.R.push(r); lut.G.push(g); lut.B.push(b);
+    lut.A.push(visible.has(id) ? 255 : 0);
+    lut.I.push(id);
+    lut.labels.push(labels[key]);
+  }
+  return lut;
+}
+
+function refreshMask() {
+  if (!hasMask()) return;
+  nv.volumes[MASK].setColormapLabel(buildLabelLut());
+  nv.updateGLVolume();
+}
+
+// Masks are mostly long runs of one value, so only checking on value changes keeps the Set cheap.
+function labelIdsIn(volume) {
+  const img = volume.img, ids = new Set();
+  let prev = 0;
+  for (let i = 0; i < img.length; i++) {
+    if (img[i] !== prev) { prev = img[i]; if (prev) ids.add(Math.round(prev)); }
+  }
+  return [...ids];
+}
+
+// Meta names win; any id present in the mask but missing from the meta is named by its number.
+function mergeLabelNames(metaLabels, idsInMask) {
+  const merged = Object.fromEntries(idsInMask.map((id) => [id, String(id)]));
+  return { ...merged, ...metaLabels };
+}
+
+const isUnnamed = (id) => labels[id] === String(id);
+const displayName = (id) => (isUnnamed(id) ? `label ${id}` : `${labels[id]} (${id})`);
+
+function renderMaskList() {
+  const ids = Object.keys(labels).map(Number);
+  $("mask-actions").hidden = ids.length === 0;
+  if (!hasMask()) { $("masks").textContent = "No mask"; return; }
+  if (ids.length === 0) { $("masks").textContent = "Mask is empty"; return; }
+  $("masks").replaceChildren(...ids.map((id) => {
+    const row = document.createElement("label");
+    row.className = "mask";
+    row.innerHTML = `<input type="checkbox" ${visible.has(id) ? "checked" : ""}>
+      <span class="swatch" style="background:${rgb(colorFor(id))}"></span><span></span>`;
+    row.lastElementChild.textContent = displayName(id);
+    row.firstElementChild.onchange = (e) => {
+      e.target.checked ? visible.add(id) : visible.delete(id);
+      refreshMask();
+    };
+    return row;
+  }));
+}
+
+function setAllVisible(on) {
+  visible = on ? new Set(Object.keys(labels).map(Number)) : new Set();
+  renderMaskList();
+  refreshMask();
+}
+
+const caseUrl = (caseId) => `/#case=${encodeURIComponent(caseId)}`;
+const fetchCase = (caseId) => fetch(`/api/cases/${encodeURIComponent(caseId)}`);
+
+async function loadCase(caseId) {
+  $("status").textContent = `Loading ${caseId}…`;
+  const res = await fetchCase(caseId);
+  if (!res.ok) { $("status").textContent = `No case "${caseId}"`; return; }
+  const c = await res.json();
+  const [calMin, calMax] = windowRange();
+  const volumes = [{ url: c.scan, colormap: "gray", cal_min: calMin, cal_max: calMax }];
+  if (c.mask) volumes.push({ url: c.mask, opacity: Number($("opacity").value) });
+  await nv.loadVolumes(volumes);
+  labels = hasMask() ? mergeLabelNames(c.labels, labelIdsIn(nv.volumes[MASK])) : {};
+  visible = new Set(Object.keys(labels).map(Number));
+  renderMaskList();
+  refreshMask();
+  // replaceState, not location.hash, so this doesn't fire hashchange and reload the case.
+  history.replaceState(null, "", caseUrl(caseId));
+  document.title = `${caseId} · remote-ct-viewer`;
+  $("case").value = caseId;
+  $("status").textContent = caseId;
+}
+
+// Pasted names often carry quotes or backticks from chat; strip them.
+const cleanCaseName = (text) => text.trim().replace(/^["'`]+|["'`]+$/g, "");
+
+// Checked before opening so a typo shows an error here instead of opening a dead tab.
+// The fetch is local and fast, so the Enter keypress still counts as the user gesture popups need.
+async function openCaseInNewTab() {
+  const caseId = cleanCaseName($("open").value);
+  if (!caseId) return;
+  if (!(await fetchCase(caseId)).ok) { $("open-error").textContent = `No case "${caseId}"`; return; }
+  $("open-error").textContent = "";
+  $("open").value = "";
+  window.open(caseUrl(caseId), "_blank");
+}
+
+const caseFromHash = () => new URLSearchParams(location.hash.slice(1)).get("case") ?? "";
+
+function describeLocation(data) {
+  const [scan, mask] = data.values;
+  const hu = `${Math.round(scan.value)} HU`;
+  const id = mask ? Math.round(mask.value) : 0;
+  const label = id ? `  ·  ${displayName(id)}` : "";
+  return `voxel ${Array.from(scan.vox).join(", ")}  ·  ${hu}${label}`;
+}
+
+nv.onLocationChange = (data) => { $("status").textContent = describeLocation(data); };
+
+$("case").onchange = (e) => loadCase(e.target.value);
+$("open").onkeydown = (e) => { if (e.key === "Enter") openCaseInNewTab(); };
+window.onhashchange = () => { if (caseFromHash()) loadCase(caseFromHash()); };
+$("window").onchange = () => {
+  [nv.volumes[SCAN].cal_min, nv.volumes[SCAN].cal_max] = windowRange();
+  nv.updateGLVolume();
+};
+$("opacity").oninput = (e) => { if (hasMask()) nv.setOpacity(MASK, Number(e.target.value)); };
+$("all").onclick = () => setAllVisible(true);
+$("none").onclick = () => setAllVisible(false);
+for (const btn of $("views").children) {
+  btn.onclick = () => {
+    nv.setSliceType(Number(btn.dataset.view));
+    for (const b of $("views").children) b.classList.toggle("on", b === btn);
+  };
+}
+
+const cases = await (await fetch("/api/cases")).json();
+$("case").replaceChildren(...cases.map((id) => new Option(id, id)));
+const initial = caseFromHash() || cases[0];
+if (initial) await loadCase(initial);
+else $("status").textContent = "No cases found. Add folders with scan.nii.gz under the cases directory.";
+</script>
+</body>
+</html>
