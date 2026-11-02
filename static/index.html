@@ -7,6 +7,7 @@
 <style>
   :root { --bg: #111; --panel: #1b1b1b; --line: #2c2c2c; --text: #ddd; --muted: #888; }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }  /* .row's display:flex would otherwise win */
   html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
                font: 13px/1.4 system-ui, sans-serif; }
   body { display: flex; }
@@ -31,7 +32,13 @@
   .swatch { width: 12px; height: 12px; border-radius: 2px; flex: none; }
   .muted { color: var(--muted); }
   #toggle-3d { width: 100%; margin-top: 6px; }
-  #toggle-3d.on { background: #2d4459; border-color: #5b8db8; }
+  #toggle-3d.on, #delete-mode.on { background: #2d4459; border-color: #5b8db8; }
+  #delete-mode { width: 100%; }
+  .mark-row { display: flex; align-items: center; gap: 6px; padding: 2px 0; }
+  .mark-row span:nth-child(2) { flex: 1; }
+  .mark-row button { padding: 0 6px; }
+  #marks:empty { display: none; }
+  #edit-result a { color: #8cc4f0; }
 </style>
 </head>
 <body>
@@ -63,16 +70,32 @@
   </div>
 
   <div id="panel-3d" hidden>
-    <h2>Render scan as</h2>
-    <select id="render-preset">
-      <option value="bone">Bone</option>
-      <option value="skin">Skin</option>
-      <option value="soft">Soft tissue</option>
-      <option value="none">Hidden (masks only)</option>
-    </select>
-    <h2>Scan opacity</h2>
-    <input type="range" id="scan-opacity" min="0" max="1" step="0.05" value="0.7">
-    <div class="muted">Drag to rotate, scroll to zoom. Lower the scan opacity to see masks inside the body.</div>
+    <label class="mask"><input type="checkbox" id="show-scan-3d"> Show scan (slower)</label>
+    <div id="scan-3d-controls" hidden>
+      <h2>Render scan as</h2>
+      <select id="render-preset">
+        <option value="bone">Bone</option>
+        <option value="skin">Skin</option>
+        <option value="soft">Soft tissue</option>
+      </select>
+      <h2>Scan opacity</h2>
+      <input type="range" id="scan-opacity" min="0" max="1" step="0.05" value="0.7">
+    </div>
+    <div class="muted">Drag to rotate, scroll to zoom.</div>
+
+    <div id="edit-panel" hidden>
+      <h2>Edit mask</h2>
+      <button id="delete-mode">Delete mode</button>
+      <div id="delete-help" class="muted" hidden>
+        Double-click a region to mark its connected component (white).
+        Double-click a marked region, or press ×, to unmark it.
+      </div>
+      <div id="marks"></div>
+      <div class="row" id="mark-actions" hidden>
+        <button id="apply-delete"></button><button id="clear-marks">Clear</button>
+      </div>
+      <div id="edit-result" class="muted"></div>
+    </div>
   </div>
 
   <h2>Masks</h2>
@@ -90,13 +113,14 @@
 
 <script type="module">
 import { Niivue } from "https://unpkg.com/@niivue/niivue@0.57.0/dist/index.js";
+import { MaskEditor, freeMarkValue, nativeIndex } from "/static/mask-edit.js";
 
 // Label colours are assigned by label id (not list position) so a label keeps its colour across cases.
 const PALETTE = [
   [230, 25, 75], [60, 180, 75], [255, 225, 25], [0, 130, 200], [245, 130, 48],
   [145, 30, 180], [70, 240, 240], [240, 50, 230], [210, 245, 60], [250, 190, 212],
 ];
-const SCAN = 0, MASK = 1;
+const MARK_COLOR = [255, 255, 255];
 
 // NiiVue volume rendering has no separate transfer function: voxels below cal_min are transparent and
 // opacity ramps up to cal_max. So a 3D preset is just an HU range, kept apart from the 2D window and
@@ -105,7 +129,6 @@ const RENDER_PRESETS = {
   bone: { range: [150, 1200] },
   skin: { range: [-400, 400] },
   soft: { range: [-100, 300] },
-  none: { range: [150, 1200], hidden: true },
 };
 // Gradient lighting gives the shaded, surface-like look of Slicer/NiiVue's "shiny" renders.
 const RENDER_LIGHTING = 0.5;
@@ -120,21 +143,41 @@ let visible = new Set();  // label ids currently shown
 let is3d = false;
 let sliceType2d = nv.sliceTypeMultiplanar;  // view to return to when 3D is toggled off
 let lightingReady = false;
+// Held by reference, not index: hiding the scan in 3D removes it from nv.volumes, which makes the
+// mask the background volume and shifts every index.
+let scanVol = null, maskVol = null;
+let currentCase = "";
+let editor = null;  // MaskEditor for the loaded mask; null without a mask
+let deleteMode = false;
 
 const colorFor = (id) => PALETTE[(id - 1) % PALETTE.length];
 const rgb = ([r, g, b]) => `rgb(${r},${g},${b})`;
 const windowRange = () => $("window").value.split(",").map(Number);
-const hasMask = () => nv.volumes.length > MASK;
+const hasMask = () => maskVol !== null;
 const renderPreset = () => RENDER_PRESETS[$("render-preset").value];
-const scanOpacity3d = () => (renderPreset().hidden ? 0 : Number($("scan-opacity").value));
+const scanShown = () => !is3d || !hasMask() || $("show-scan-3d").checked;
+
+// Setting the scan's opacity to 0 does not make 3D faster: NiiVue still ray-marches it, then marches
+// the masks in a second pass. Taking the scan out of nv.volumes makes the mask the background volume,
+// so the render is a single pass over the mask alone. It also means a 3D double-click picks the mask
+// surface instead of the skin, which delete mode relies on.
+function placeScan(shown) {
+  const inScene = nv.volumes.includes(scanVol);
+  if (shown && !inScene) {
+    nv.addVolume(scanVol);
+    nv.setVolume(scanVol, 0);
+  }
+  if (!shown && inScene) nv.removeVolume(scanVol);
+}
 
 // In 3D the masks are drawn in a second ray-marching pass and fade the deeper they sit behind opaque
 // scan voxels, so the scan's opacity is what decides how much of a mask inside the body shows.
 function applyScanDisplay() {
-  if (!nv.volumes.length) return;
-  const scan = nv.volumes[SCAN];
-  [scan.cal_min, scan.cal_max] = is3d ? renderPreset().range : windowRange();
-  scan.opacity = is3d ? scanOpacity3d() : 1;
+  if (!scanVol) return;
+  placeScan(scanShown());
+  [scanVol.cal_min, scanVol.cal_max] = is3d ? renderPreset().range : windowRange();
+  scanVol.opacity = is3d ? Number($("scan-opacity").value) : 1;
+  $("scan-3d-controls").hidden = !scanShown();
   nv.updateGLVolume();
 }
 
@@ -152,6 +195,7 @@ async function set3d(on) {
   $("toggle-3d").classList.toggle("on", on);
   $("panel-2d").hidden = on;
   $("panel-3d").hidden = !on;
+  if (!on) setDeleteMode(false);
   applyScanDisplay();
 }
 
@@ -166,12 +210,18 @@ function buildLabelLut() {
     lut.I.push(id);
     lut.labels.push(labels[key]);
   }
+  if (editor) {
+    lut.R.push(MARK_COLOR[0]); lut.G.push(MARK_COLOR[1]); lut.B.push(MARK_COLOR[2]);
+    lut.A.push(255);
+    lut.I.push(editor.markValue);
+    lut.labels.push("marked for deletion");
+  }
   return lut;
 }
 
 function refreshMask() {
   if (!hasMask()) return;
-  nv.volumes[MASK].setColormapLabel(buildLabelLut());
+  maskVol.setColormapLabel(buildLabelLut());
   nv.updateGLVolume();
 }
 
@@ -192,7 +242,10 @@ function mergeLabelNames(metaLabels, idsInMask) {
 }
 
 const isUnnamed = (id) => labels[id] === String(id);
-const displayName = (id) => (isUnnamed(id) ? `label ${id}` : `${labels[id]} (${id})`);
+const displayName = (id) => {
+  if (editor && id === editor.markValue) return "marked for deletion";
+  return isUnnamed(id) ? `label ${id}` : `${labels[id]} (${id})`;
+};
 
 function renderMaskList() {
   const ids = Object.keys(labels).map(Number);
@@ -219,6 +272,97 @@ function setAllVisible(on) {
   refreshMask();
 }
 
+// Delete mode needs the scan out of the 3D scene so double-clicks land on the mask, not the skin.
+function setDeleteMode(on) {
+  deleteMode = on && editor !== null;
+  $("delete-mode").classList.toggle("on", deleteMode);
+  $("delete-help").hidden = !deleteMode;
+  $("show-scan-3d").disabled = deleteMode;
+  if (deleteMode) $("show-scan-3d").checked = false;
+  applyScanDisplay();
+}
+
+function renderMarks() {
+  const marks = editor ? editor.marks : [];
+  $("mark-actions").hidden = marks.length === 0;
+  $("apply-delete").textContent = `Delete ${marks.length} → new case`;
+  $("marks").replaceChildren(...marks.map((mark) => {
+    const row = document.createElement("div");
+    row.className = "mark-row";
+    row.innerHTML = `<span class="swatch" style="background:${rgb(colorFor(mark.label))}"></span>
+      <span></span><button title="Unmark">×</button>`;
+    row.children[1].textContent = `${displayName(mark.label)} · ${mark.indices.length.toLocaleString()} vox`;
+    row.lastElementChild.onclick = () => { editor.unmark(mark); afterMarksChanged(); };
+    return row;
+  }));
+}
+
+function afterMarksChanged() {
+  renderMarks();
+  nv.updateGLVolume();  // the marks were written into the mask's image buffer
+}
+
+// NiiVue has already moved the crosshair to the picked surface point by the time this runs (its own
+// dblclick listener was registered first). A crosshair still on the sentinel means the click hit nothing.
+function pickedMaskIndex() {
+  const missed = nv.scene.crosshairPos.every((v) => v === PICK_SENTINEL);
+  if (missed) {
+    nv.scene.crosshairPos = crosshairBeforePick;
+    nv.drawScene();
+    return -1;
+  }
+  const mm = nv.frac2mm(nv.scene.crosshairPos, 0, true);
+  return editor.seedNear(nativeIndex(maskVol, maskVol.mm2vox(mm)));
+}
+
+function toggleMarkAtPick() {
+  const index = pickedMaskIndex();
+  if (index < 0) { $("status").textContent = "No mask region under the cursor"; return; }
+  if (editor.isMarked(index)) {
+    const mark = editor.markContaining(index);
+    editor.unmark(mark);
+    $("status").textContent = `Unmarked ${displayName(mark.label)}`;
+  } else {
+    const mark = editor.markComponentAt(index);
+    $("status").textContent = `Marked ${displayName(mark.label)}: ${mark.indices.length.toLocaleString()} voxels`;
+  }
+  afterMarksChanged();
+}
+
+// NiiVue writes the edited buffer with the mask's own header; the server re-saves it under the
+// original mask's header and checks that the edit only zeroed voxels.
+async function saveEditedMask() {
+  const original = maskVol.img;
+  maskVol.img = editor.editedImage();
+  let bytes;
+  try { bytes = await maskVol.saveToUint8Array("mask.nii.gz"); } finally { maskVol.img = original; }
+  const res = await fetch(`/api/cases/${encodeURIComponent(currentCase)}/edited-mask`, {
+    method: "POST", body: bytes, headers: { "content-type": "application/gzip" },
+  });
+  if (!res.ok) throw new Error((await res.json()).detail ?? res.statusText);
+  return (await res.json()).id;
+}
+
+async function applyDelete() {
+  if (editor.marks.length === 0) return;
+  $("apply-delete").disabled = true;
+  $("edit-result").textContent = "Saving…";
+  try {
+    const newCase = await saveEditedMask();
+    editor.clear();
+    afterMarksChanged();
+    $("edit-result").innerHTML = `Saved as <a target="_blank"></a>`;
+    const link = $("edit-result").firstElementChild;
+    link.href = caseUrl(newCase);
+    link.textContent = newCase;
+    $("case").append(new Option(newCase, newCase));
+  } catch (err) {
+    $("edit-result").textContent = `Save failed: ${err.message}`;
+  } finally {
+    $("apply-delete").disabled = false;
+  }
+}
+
 const caseUrl = (caseId) => `/#case=${encodeURIComponent(caseId)}`;
 const fetchCase = (caseId) => fetch(`/api/cases/${encodeURIComponent(caseId)}`);
 
@@ -231,16 +375,28 @@ async function loadCase(caseId) {
   const volumes = [{ url: c.scan, colormap: "gray", cal_min: calMin, cal_max: calMax }];
   if (c.mask) volumes.push({ url: c.mask, opacity: Number($("opacity").value) });
   await nv.loadVolumes(volumes);
-  applyScanDisplay();
-  labels = hasMask() ? mergeLabelNames(c.labels, labelIdsIn(nv.volumes[MASK])) : {};
+  [scanVol, maskVol = null] = nv.volumes;
+  currentCase = caseId;
+  labels = hasMask() ? mergeLabelNames(c.labels, labelIdsIn(maskVol)) : {};
   visible = new Set(Object.keys(labels).map(Number));
+  editor = createEditor();
+  $("edit-panel").hidden = editor === null;
+  $("edit-result").textContent = "";
+  setDeleteMode(false);
   renderMaskList();
+  renderMarks();
   refreshMask();
   // replaceState, not location.hash, so this doesn't fire hashchange and reload the case.
   history.replaceState(null, "", caseUrl(caseId));
   document.title = `${caseId} · remote-ct-viewer`;
   $("case").value = caseId;
   $("status").textContent = caseId;
+}
+
+function createEditor() {
+  if (!hasMask()) return null;
+  const markValue = freeMarkValue(maskVol.img, Object.keys(labels).map(Number));
+  return markValue === null ? null : new MaskEditor(maskVol, markValue);
 }
 
 // Pasted names often carry quotes or backticks from chat; strip them.
@@ -259,24 +415,46 @@ async function openCaseInNewTab() {
 
 const caseFromHash = () => new URLSearchParams(location.hash.slice(1)).get("case") ?? "";
 
+// Looked up by volume id because the scan is missing from the values while hidden in 3D.
 function describeLocation(data) {
-  const [scan, mask] = data.values;
-  const hu = `${Math.round(scan.value)} HU`;
+  const scan = data.values.find((v) => v.id === scanVol?.id);
+  const mask = data.values.find((v) => v.id === maskVol?.id);
+  const parts = [`voxel ${Array.from((scan ?? mask).vox).join(", ")}`];
+  if (scan) parts.push(`${Math.round(scan.value)} HU`);
   const id = mask ? Math.round(mask.value) : 0;
-  const label = id ? `  ·  ${displayName(id)}` : "";
-  return `voxel ${Array.from(scan.vox).join(", ")}  ·  ${hu}${label}`;
+  if (id) parts.push(displayName(id));
+  return parts.join("  ·  ");
 }
 
 nv.onLocationChange = (data) => { $("status").textContent = describeLocation(data); };
+
+// Capture phase on window runs before NiiVue's canvas listener picks. Parking the crosshair outside the
+// volume (fractions run 0..1) tells a miss apart from re-picking the same point, which leaves it unmoved.
+const PICK_SENTINEL = 2;
+let crosshairBeforePick = null;
+window.addEventListener("dblclick", () => {
+  if (!(is3d && deleteMode)) return;
+  crosshairBeforePick = nv.scene.crosshairPos;
+  nv.scene.crosshairPos = new Float32Array([PICK_SENTINEL, PICK_SENTINEL, PICK_SENTINEL]);
+}, true);
+$("viewer").addEventListener("dblclick", () => { if (is3d && deleteMode) toggleMarkAtPick(); });
 
 $("case").onchange = (e) => loadCase(e.target.value);
 $("open").onkeydown = (e) => { if (e.key === "Enter") openCaseInNewTab(); };
 window.onhashchange = () => { if (caseFromHash()) loadCase(caseFromHash()); };
 $("window").onchange = applyScanDisplay;
 $("render-preset").onchange = applyScanDisplay;
+$("show-scan-3d").onchange = applyScanDisplay;
+$("delete-mode").onclick = () => setDeleteMode(!deleteMode);
+$("apply-delete").onclick = applyDelete;
+$("clear-marks").onclick = () => { editor.clear(); afterMarksChanged(); };
 $("scan-opacity").oninput = applyScanDisplay;
 $("toggle-3d").onclick = () => set3d(!is3d);
-$("opacity").oninput = (e) => { if (hasMask()) nv.setOpacity(MASK, Number(e.target.value)); };
+$("opacity").oninput = (e) => {
+  if (!hasMask()) return;
+  maskVol.opacity = Number(e.target.value);
+  nv.updateGLVolume();
+};
 $("all").onclick = () => setAllVisible(true);
 $("none").onclick = () => setAllVisible(false);
 for (const btn of $("views").children) {

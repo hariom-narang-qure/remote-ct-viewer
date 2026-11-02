@@ -40,8 +40,17 @@ ssh -L 8000:localhost:8000 <user>@<remote>       # on your laptop, then open htt
 Paste a case name into the "Open case" box and press Enter to open it in a new tab.
 Links like `http://localhost:8000/#case=<case_id>` open a specific case.
 In the viewer, scroll to change slices, right-drag to adjust window/level, and click to read HU and the label.
-The "3D render" button toggles a volume render with the masks drawn in. Pick how the scan is rendered
-(bone, skin, soft tissue, or hidden for masks only) and lower the scan opacity to see masks inside the body.
+The "3D render" button toggles a volume render of the masks. Tick "Show scan" to render the CT around
+them too (bone, skin or soft tissue preset, adjustable opacity); it is off by default because it is slower.
+
+### Deleting mask regions (3D)
+
+In 3D, "Delete mode" lets you remove connected components from the mask:
+
+1. Double-click a region: its connected component (same label, 6-connected) turns white and is listed.
+2. Double-click a white region, or press its ×, to unmark it.
+3. "Delete N → new case" saves a copy of the mask with the marked components set to 0 as a new case
+   `<case>-edit<n>`, sharing the scan. The original case is never modified.
 
 ## Claude Code skill
 
