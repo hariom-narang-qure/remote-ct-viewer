@@ -40,6 +40,8 @@ ssh -L 8000:localhost:8000 <user>@<remote>       # on your laptop, then open htt
 Paste a case name into the "Open case" box and press Enter to open it in a new tab.
 Links like `http://localhost:8000/#case=<case_id>` open a specific case.
 In the viewer, scroll to change slices, right-drag to adjust window/level, and click to read HU and the label.
+The "3D render" button toggles a volume render with the masks drawn in. Pick how the scan is rendered
+(bone, skin, soft tissue, or hidden for masks only) and lower the scan opacity to see masks inside the body.
 
 ## Claude Code skill
 

@@ -26,9 +26,12 @@
   button { background: #262626; color: var(--text); border: 1px solid var(--line);
            padding: 4px 8px; cursor: pointer; }
   button.on { border-color: #888; background: #333; }
+  label.mask input { width: auto; }
   label.mask { display: flex; align-items: center; gap: 6px; padding: 2px 0; cursor: pointer; }
   .swatch { width: 12px; height: 12px; border-radius: 2px; flex: none; }
   .muted { color: var(--muted); }
+  #toggle-3d { width: 100%; margin-top: 6px; }
+  #toggle-3d.on { background: #2d4459; border-color: #5b8db8; }
 </style>
 </head>
 <body>
@@ -46,16 +49,31 @@
     <button data-view="1">Coronal</button>
     <button data-view="2">Sagittal</button>
     <button data-view="3" class="on">MPR</button>
-    <button data-view="4">3D</button>
+  </div>
+  <button id="toggle-3d">3D render</button>
+
+  <div id="panel-2d">
+    <h2>Window</h2>
+    <select id="window">
+      <option value="-1350,150">Lung (W1500 L-600)</option>
+      <option value="-160,240">Soft tissue (W400 L40)</option>
+      <option value="-500,1300">Bone (W1800 L400)</option>
+    </select>
+    <div class="muted">Right-drag to adjust.</div>
   </div>
 
-  <h2>Window</h2>
-  <select id="window">
-    <option value="-1350,150">Lung (W1500 L-600)</option>
-    <option value="-160,240">Soft tissue (W400 L40)</option>
-    <option value="-500,1300">Bone (W1800 L400)</option>
-  </select>
-  <div class="muted">Right-drag to adjust.</div>
+  <div id="panel-3d" hidden>
+    <h2>Render scan as</h2>
+    <select id="render-preset">
+      <option value="bone">Bone</option>
+      <option value="skin">Skin</option>
+      <option value="soft">Soft tissue</option>
+      <option value="none">Hidden (masks only)</option>
+    </select>
+    <h2>Scan opacity</h2>
+    <input type="range" id="scan-opacity" min="0" max="1" step="0.05" value="0.7">
+    <div class="muted">Drag to rotate, scroll to zoom. Lower the scan opacity to see masks inside the body.</div>
+  </div>
 
   <h2>Masks</h2>
   <div id="masks" class="muted">No mask</div>
@@ -80,6 +98,18 @@ const PALETTE = [
 ];
 const SCAN = 0, MASK = 1;
 
+// NiiVue volume rendering has no separate transfer function: voxels below cal_min are transparent and
+// opacity ramps up to cal_max. So a 3D preset is just an HU range, kept apart from the 2D window and
+// swapped in while the 3D view is on. Ranges are rough equivalents of Slicer's CT presets.
+const RENDER_PRESETS = {
+  bone: { range: [150, 1200] },
+  skin: { range: [-400, 400] },
+  soft: { range: [-100, 300] },
+  none: { range: [150, 1200], hidden: true },
+};
+// Gradient lighting gives the shaded, surface-like look of Slicer/NiiVue's "shiny" renders.
+const RENDER_LIGHTING = 0.5;
+
 const $ = (id) => document.getElementById(id);
 const nv = new Niivue({ backColor: [0, 0, 0, 1], show3Dcrosshair: true, isRadiologicalConvention: true });
 await nv.attachTo("viewer");
@@ -87,11 +117,43 @@ nv.setSliceType(nv.sliceTypeMultiplanar);
 
 let labels = {};          // {"1": "liver", ...}: mask-meta.json names plus ids found in the mask
 let visible = new Set();  // label ids currently shown
+let is3d = false;
+let sliceType2d = nv.sliceTypeMultiplanar;  // view to return to when 3D is toggled off
+let lightingReady = false;
 
 const colorFor = (id) => PALETTE[(id - 1) % PALETTE.length];
 const rgb = ([r, g, b]) => `rgb(${r},${g},${b})`;
 const windowRange = () => $("window").value.split(",").map(Number);
 const hasMask = () => nv.volumes.length > MASK;
+const renderPreset = () => RENDER_PRESETS[$("render-preset").value];
+const scanOpacity3d = () => (renderPreset().hidden ? 0 : Number($("scan-opacity").value));
+
+// In 3D the masks are drawn in a second ray-marching pass and fade the deeper they sit behind opaque
+// scan voxels, so the scan's opacity is what decides how much of a mask inside the body shows.
+function applyScanDisplay() {
+  if (!nv.volumes.length) return;
+  const scan = nv.volumes[SCAN];
+  [scan.cal_min, scan.cal_max] = is3d ? renderPreset().range : windowRange();
+  scan.opacity = is3d ? scanOpacity3d() : 1;
+  nv.updateGLVolume();
+}
+
+// The lit render shader is compiled on first use, so 2D-only sessions never pay for it.
+async function enableRenderLighting() {
+  if (lightingReady) return;
+  await nv.setVolumeRenderIllumination(RENDER_LIGHTING);
+  lightingReady = true;
+}
+
+async function set3d(on) {
+  is3d = on;
+  if (on) await enableRenderLighting();
+  nv.setSliceType(on ? nv.sliceTypeRender : sliceType2d);
+  $("toggle-3d").classList.toggle("on", on);
+  $("panel-2d").hidden = on;
+  $("panel-3d").hidden = !on;
+  applyScanDisplay();
+}
 
 // NiiVue draws a volume as a label map once it has a label LUT. Hiding a label = alpha 0 in the LUT.
 function buildLabelLut() {
@@ -169,6 +231,7 @@ async function loadCase(caseId) {
   const volumes = [{ url: c.scan, colormap: "gray", cal_min: calMin, cal_max: calMax }];
   if (c.mask) volumes.push({ url: c.mask, opacity: Number($("opacity").value) });
   await nv.loadVolumes(volumes);
+  applyScanDisplay();
   labels = hasMask() ? mergeLabelNames(c.labels, labelIdsIn(nv.volumes[MASK])) : {};
   visible = new Set(Object.keys(labels).map(Number));
   renderMaskList();
@@ -209,17 +272,19 @@ nv.onLocationChange = (data) => { $("status").textContent = describeLocation(dat
 $("case").onchange = (e) => loadCase(e.target.value);
 $("open").onkeydown = (e) => { if (e.key === "Enter") openCaseInNewTab(); };
 window.onhashchange = () => { if (caseFromHash()) loadCase(caseFromHash()); };
-$("window").onchange = () => {
-  [nv.volumes[SCAN].cal_min, nv.volumes[SCAN].cal_max] = windowRange();
-  nv.updateGLVolume();
-};
+$("window").onchange = applyScanDisplay;
+$("render-preset").onchange = applyScanDisplay;
+$("scan-opacity").oninput = applyScanDisplay;
+$("toggle-3d").onclick = () => set3d(!is3d);
 $("opacity").oninput = (e) => { if (hasMask()) nv.setOpacity(MASK, Number(e.target.value)); };
 $("all").onclick = () => setAllVisible(true);
 $("none").onclick = () => setAllVisible(false);
 for (const btn of $("views").children) {
   btn.onclick = () => {
-    nv.setSliceType(Number(btn.dataset.view));
+    sliceType2d = Number(btn.dataset.view);
     for (const b of $("views").children) b.classList.toggle("on", b === btn);
+    if (is3d) set3d(false);
+    else nv.setSliceType(sliceType2d);
   };
 }
 
