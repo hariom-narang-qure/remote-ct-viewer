@@ -39,6 +39,36 @@
   .mark-row button { padding: 0 6px; }
   #marks:empty { display: none; }
   #edit-result a { color: #8cc4f0; }
+  #notes-panel { width: 320px; flex: none; padding: 12px; background: var(--panel);
+                 border-left: 1px solid var(--line); overflow-y: auto; }
+  #notes-panel header { display: flex; justify-content: space-between; align-items: center; }
+  #notes-panel header h2 { margin: 0; }
+  #show-notes { width: 100%; margin-top: 6px; }
+  #notes { overflow-wrap: anywhere; }
+  #notes h1, #notes h2, #notes h3 { color: var(--text); text-transform: none; letter-spacing: 0;
+                                    margin: 14px 0 6px; }
+  #notes h1 { font-size: 16px; } #notes h2 { font-size: 14px; } #notes h3 { font-size: 13px; }
+  #notes a { color: #8cc4f0; }
+  #notes code { background: #262626; padding: 0 3px; border-radius: 2px; }
+  #notes pre { background: #222; padding: 8px; overflow-x: auto; }
+  #notes pre code { padding: 0; background: none; }
+  #notes ul, #notes ol { padding-left: 20px; }
+  #notes table { border-collapse: collapse; }
+  #notes th, #notes td { border: 1px solid var(--line); padding: 2px 6px; }
+  #notes blockquote { margin: 0; padding-left: 10px; border-left: 3px solid var(--line); color: var(--muted); }
+  #notes img { max-width: 100%; }
+  #project-link { display: block; margin-top: 6px; color: #8cc4f0; overflow-wrap: anywhere; }
+  #my-notes { width: 100%; margin-top: 6px; }
+  #my-notes.has-notes { border-color: #5b8db8; }
+  #my-notes-preview { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 8em; overflow: hidden;
+                      margin-top: 4px; }
+  #notes-dialog { background: var(--panel); color: var(--text); border: 1px solid var(--line);
+                  width: min(560px, 90vw); padding: 12px; }
+  #notes-dialog::backdrop { background: rgba(0, 0, 0, .5); }
+  #notes-dialog h2 { margin: 0 0 8px; }
+  #notes-text { width: 100%; height: 40vh; resize: vertical; background: #222; color: var(--text);
+                border: 1px solid var(--line); padding: 6px; font: 13px/1.4 system-ui, sans-serif; }
+  #notes-dialog footer { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; }
 </style>
 </head>
 <body>
@@ -49,6 +79,9 @@
 
   <h2>Case</h2>
   <select id="case"></select>
+  <a id="project-link" target="_blank"></a>
+  <button id="my-notes" title="Your notes on this case, saved in the project's project.json">My notes</button>
+  <div id="my-notes-preview" class="muted"></div>
 
   <h2>View</h2>
   <div class="row" id="views">
@@ -58,6 +91,7 @@
     <button data-view="3" class="on">MPR</button>
   </div>
   <button id="toggle-3d">3D render</button>
+  <button id="show-notes" hidden>Show notes</button>
 
   <div id="panel-2d">
     <h2>Window</h2>
@@ -110,10 +144,27 @@
   <canvas id="viewer"></canvas>
   <div id="status">&nbsp;</div>
 </main>
+<aside id="notes-panel" hidden>
+  <header><h2>Notes</h2><button id="hide-notes" title="Hide notes">×</button></header>
+  <div id="notes"></div>
+</aside>
+
+<dialog id="notes-dialog">
+  <form method="dialog">
+    <h2 id="notes-dialog-title">My notes</h2>
+    <textarea id="notes-text" spellcheck="true"></textarea>
+    <footer>
+      <span id="notes-dialog-status" class="muted">Ctrl+Enter to save</span>
+      <span class="row"><button value="cancel">Cancel</button><button id="save-notes" value="save">Save</button></span>
+    </footer>
+  </form>
+</dialog>
 
 <script type="module">
 import { Niivue } from "https://unpkg.com/@niivue/niivue@0.57.0/dist/index.js";
 import { MaskEditor, freeMarkValue, nativeIndex } from "/static/mask-edit.js";
+import { marked } from "https://cdn.jsdelivr.net/npm/marked@12.0.2/lib/marked.esm.js";
+import DOMPurify from "https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.es.mjs";
 
 // Label colours are assigned by label id (not list position) so a label keeps its colour across cases.
 const PALETTE = [
@@ -336,7 +387,7 @@ async function saveEditedMask() {
   maskVol.img = editor.editedImage();
   let bytes;
   try { bytes = await maskVol.saveToUint8Array("mask.nii.gz"); } finally { maskVol.img = original; }
-  const res = await fetch(`/api/cases/${encodeURIComponent(currentCase)}/edited-mask`, {
+  const res = await fetch(`/api/edited-mask/${idPath(currentCase)}`, {
     method: "POST", body: bytes, headers: { "content-type": "application/gzip" },
   });
   if (!res.ok) throw new Error((await res.json()).detail ?? res.statusText);
@@ -363,8 +414,11 @@ async function applyDelete() {
   }
 }
 
+// Ids are "/"-separated paths (project/sub/case); each segment is encoded, the slashes are kept.
+const idPath = (id) => id.split("/").map(encodeURIComponent).join("/");
 const caseUrl = (caseId) => `/#case=${encodeURIComponent(caseId)}`;
-const fetchCase = (caseId) => fetch(`/api/cases/${encodeURIComponent(caseId)}`);
+const projectUrl = (projectId) => `/projects/${projectId ? idPath(projectId) + "/" : ""}`;
+const fetchCase = (caseId) => fetch(`/api/cases/${idPath(caseId)}`);
 
 async function loadCase(caseId) {
   $("status").textContent = `Loading ${caseId}…`;
@@ -386,6 +440,9 @@ async function loadCase(caseId) {
   renderMaskList();
   renderMarks();
   refreshMask();
+  showNotes(c.notes);
+  showProject(c.project);
+  showUserNotes(c.user_notes.notes ?? "");
   // replaceState, not location.hash, so this doesn't fire hashchange and reload the case.
   history.replaceState(null, "", caseUrl(caseId));
   document.title = `${caseId} · remote-ct-viewer`;
@@ -397,6 +454,66 @@ function createEditor() {
   if (!hasMask()) return null;
   const markValue = freeMarkValue(maskVol.img, Object.keys(labels).map(Number));
   return markValue === null ? null : new MaskEditor(maskVol, markValue);
+}
+
+// Notes are arbitrary text from the case folder, rendered as HTML, so they are sanitised: without it a
+// note could run script in the page.
+const renderMarkdown = (text) => DOMPurify.sanitize(marked.parse(text));
+
+let notesHidden = false;  // kept across cases, so someone who closed the panel isn't nagged by every case
+function showNotes(text) {
+  $("notes").innerHTML = text ? renderMarkdown(text) : "";
+  setNotesPanel(Boolean(text) && !notesHidden, Boolean(text));
+}
+
+function setNotesPanel(open, hasNotes = $("notes").innerHTML !== "") {
+  $("notes-panel").hidden = !open;
+  $("show-notes").hidden = open || !hasNotes;
+  nv.resizeListener();  // the canvas width changed with the panel
+}
+
+function showProject(projectId) {
+  $("project-link").href = projectUrl(projectId);
+  $("project-link").textContent = `Project: ${projectId || "(root)"} →`;
+}
+
+let userNotes = "";
+function showUserNotes(text) {
+  userNotes = text;
+  $("my-notes").classList.toggle("has-notes", text !== "");
+  $("my-notes").textContent = text ? "My notes ✎" : "Add my notes";
+  $("my-notes-preview").textContent = text;
+}
+
+function openNotesDialog() {
+  $("notes-dialog-title").textContent = `My notes · ${currentCase}`;
+  $("notes-text").value = userNotes;
+  $("notes-dialog-status").textContent = "Ctrl+Enter to save";
+  $("notes-dialog").showModal();
+  $("notes-text").focus();
+}
+
+async function saveUserNotes() {
+  const res = await fetch(`/api/user-notes/${idPath(currentCase)}`, {
+    method: "PUT", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ notes: $("notes-text").value }),
+  });
+  if (!res.ok) throw new Error((await res.json()).detail ?? res.statusText);
+  showUserNotes((await res.json()).notes);
+}
+
+// The dialog only closes once the save went through, so a failed save never loses what was typed.
+async function submitNotesDialog() {
+  $("save-notes").disabled = true;
+  $("notes-dialog-status").textContent = "Saving…";
+  try {
+    await saveUserNotes();
+    $("notes-dialog").close();
+  } catch (err) {
+    $("notes-dialog-status").textContent = `Save failed: ${err.message}`;
+  } finally {
+    $("save-notes").disabled = false;
+  }
 }
 
 // Pasted names often carry quotes or backticks from chat; strip them.
@@ -454,6 +571,17 @@ $("opacity").oninput = (e) => {
   if (!hasMask()) return;
   maskVol.opacity = Number(e.target.value);
   nv.updateGLVolume();
+};
+$("hide-notes").onclick = () => { notesHidden = true; setNotesPanel(false); };
+$("show-notes").onclick = () => { notesHidden = false; setNotesPanel(true); };
+$("my-notes").onclick = openNotesDialog;
+$("notes-dialog").addEventListener("submit", (e) => {
+  if (e.submitter?.value !== "save") return;  // Cancel closes the dialog as usual
+  e.preventDefault();
+  submitNotesDialog();
+});
+$("notes-text").onkeydown = (e) => {
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submitNotesDialog(); }
 };
 $("all").onclick = () => setAllVisible(true);
 $("none").onclick = () => setAllVisible(false);

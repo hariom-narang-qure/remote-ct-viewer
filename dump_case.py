@@ -5,6 +5,7 @@ Inputs are converted to the layout server.py expects:
               size of float32, so it downloads and loads faster in the browser.
   - mask   -> mask.nii.gz, as the smallest unsigned int type that holds all labels.
   - labels -> mask-meta.json. Labels left out still show in the viewer, named by their number.
+  - notes  -> notes.md, copied as is. Markdown shown in a panel beside the viewer.
 
 Each input is read by the first reader that fits:
   - .nii / .nii.gz: nibabel.
@@ -14,26 +15,27 @@ Each input is read by the first reader that fits:
   - anything else (DICOM folder, .nrrd, .mha, ...): SimpleITK. Its NIfTI writer converts
     LPS to RAS, so we round-trip through a temporary .nii.gz to get a correct affine.
 
+NAME may be a path, "project/sub/case", to file the case under a project folder (see case_layout.py).
+Missing project folders are created. A case can't be put inside another case's folder.
+
 The mask must be on the scan's grid (same shape and affine). We refuse otherwise, because NiiVue
 would quietly resample it and the overlay would look plausible but wrong.
 
 Usage:
   uv run --project <repo> python <repo>/dump_case.py NAME --scan CT [--mask MASK]
-      [--labels '{"1": "nodule"}'] [--spacing 0.7 0.7 1.25] [--overwrite]
+      [--labels '{"1": "nodule"}'] [--notes NOTES.md] [--spacing 0.7 0.7 1.25] [--overwrite]
 """
 
 import argparse
 import json
-import re
 import tempfile
 from pathlib import Path
 
 import nibabel as nib
 import numpy as np
 
-from case_layout import CASES_DIR, MASK_FILE, META_FILE, SCAN_FILE
+from case_layout import CASES_DIR, MASK_FILE, META_FILE, NOTES_FILE, SCAN_FILE, SEGMENT, is_case, path_for
 
-CASE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 VIEWER_URL = "http://localhost:8000"
 
 
@@ -87,21 +89,31 @@ def check_same_grid(scan: nib.Nifti1Image, mask: nib.Nifti1Image):
         raise ValueError(f"Mask affine differs from scan affine:\n{mask.affine}\nvs\n{scan.affine}")
 
 
+def check_case_path(name: str) -> Path:
+    case_dir = path_for(name)
+    if case_dir is None or case_dir == CASES_DIR:
+        raise ValueError(f"Case name {name!r} must be '/'-separated parts each matching {SEGMENT.pattern}")
+    for parent in case_dir.relative_to(CASES_DIR).parents:
+        if is_case(CASES_DIR / parent):
+            raise ValueError(f"{parent.as_posix()!r} is a case, so it can't hold other cases")
+    if case_dir.exists() and not is_case(case_dir):
+        raise FileExistsError(f"{name!r} is an existing project folder, not a case")
+    return case_dir
+
+
 def prepare_case_dir(name: str, overwrite: bool) -> Path:
-    if not CASE_NAME.match(name):
-        raise ValueError(f"Case name {name!r} must match {CASE_NAME.pattern}")
-    case_dir = CASES_DIR / name
+    case_dir = check_case_path(name)
     if case_dir.exists() and not overwrite:
         raise FileExistsError(f"Case {name!r} already exists; pick another name or pass overwrite")
     case_dir.mkdir(parents=True, exist_ok=True)
     # Clear old files so a stale mask or meta from a previous dump can't linger.
-    for file_name in (SCAN_FILE, MASK_FILE, META_FILE):
+    for file_name in (SCAN_FILE, MASK_FILE, META_FILE, NOTES_FILE):
         (case_dir / file_name).unlink(missing_ok=True)
     return case_dir
 
 
-def write_case(name, scan, mask=None, labels=None, overwrite=False) -> Path:
-    """scan and mask are nibabel images. labels maps label id -> display name."""
+def write_case(name, scan, mask=None, labels=None, overwrite=False, notes=None) -> Path:
+    """scan and mask are nibabel images. labels maps label id -> display name. notes is Markdown text."""
     scan = to_int16_hu(scan)
     if mask is not None:
         mask = to_label_map(mask)
@@ -114,15 +126,18 @@ def write_case(name, scan, mask=None, labels=None, overwrite=False) -> Path:
     if labels:
         meta = {"labels": {str(int(k)): str(v) for k, v in labels.items()}}
         (case_dir / META_FILE).write_text(json.dumps(meta, indent=2) + "\n")
+    if notes:
+        (case_dir / NOTES_FILE).write_text(notes)
     return case_dir
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("name", help="case name, shown in the viewer and pasted into its Open case box")
+    parser.add_argument("name", help="case name, optionally under a project: proj/case. Pasted into the viewer's Open case box")
     parser.add_argument("--scan", type=Path, required=True)
     parser.add_argument("--mask", type=Path)
     parser.add_argument("--labels", type=json.loads, help='JSON object, e.g. \'{"1": "nodule"}\'')
+    parser.add_argument("--notes", type=Path, help="Markdown file shown beside the viewer")
     parser.add_argument("--spacing", type=float, nargs=3, default=(1.0, 1.0, 1.0), help="mm, only for .npy")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -132,10 +147,13 @@ def main():
     args = parse_args()
     scan = load_image(args.scan, args.spacing)
     mask = load_image(args.mask, args.spacing) if args.mask else None
-    case_dir = write_case(args.name, scan, mask, args.labels, args.overwrite)
+    notes = args.notes.read_text() if args.notes else None
+    case_dir = write_case(args.name, scan, mask, args.labels, args.overwrite, notes)
     print(f"Wrote {case_dir}")
     print(f"Case: {args.name}")
     print(f"URL:  {VIEWER_URL}/#case={args.name}")
+    if "/" in args.name:
+        print(f"Project: {VIEWER_URL}/projects/{args.name.rpartition('/')[0]}/")
 
 
 if __name__ == "__main__":

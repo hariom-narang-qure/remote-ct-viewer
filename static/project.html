@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Project · remote-ct-viewer</title>
+<style>
+  :root { --bg: #111; --panel: #1b1b1b; --line: #2c2c2c; --text: #ddd; --muted: #888; --link: #8cc4f0; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.4 system-ui, sans-serif; }
+  body { padding: 16px; }
+  a { color: var(--link); }
+  h1 { font-size: 16px; margin: 0 0 12px; font-weight: 600; }
+  h1 a { text-decoration: none; }
+  h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 18px 0 6px; }
+  .muted { color: var(--muted); }
+  #projects { display: flex; flex-wrap: wrap; gap: 6px; }
+  #projects a { padding: 3px 8px; border: 1px solid var(--line); background: var(--panel); text-decoration: none; }
+  #filter { background: #222; color: var(--text); border: 1px solid var(--line); padding: 4px 6px;
+            width: min(320px, 100%); margin-bottom: 8px; }
+  .table-wrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border-bottom: 1px solid var(--line); padding: 6px 8px; text-align: left; vertical-align: top; }
+  th { color: var(--muted); font-weight: normal; position: sticky; top: 0; background: var(--bg); }
+  td.notes { white-space: pre-wrap; overflow-wrap: anywhere; width: 60%; }
+  td.when, td.flags { white-space: nowrap; color: var(--muted); font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<h1 id="crumbs"></h1>
+<div id="projects-section" hidden>
+  <h2>Projects</h2>
+  <div id="projects"></div>
+</div>
+<h2>Cases</h2>
+<input id="filter" placeholder="Filter by case name or notes" autocomplete="off">
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Case</th><th>My notes</th><th>Updated</th><th></th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+</div>
+<div id="empty" class="muted"></div>
+
+<script type="module">
+const $ = (id) => document.getElementById(id);
+
+// The project id is whatever follows /projects/ in the address, e.g. /projects/fissures/run3/.
+const projectId = decodeURIComponent(location.pathname.replace(/^\/projects\/?/, "").replace(/\/$/, ""));
+const idPath = (id) => id.split("/").map(encodeURIComponent).join("/");
+const projectUrl = (id) => `/projects/${id ? idPath(id) + "/" : ""}`;
+const caseUrl = (id) => `/#case=${encodeURIComponent(id)}`;
+
+function link(href, text) {
+  const a = document.createElement("a");
+  a.href = href;
+  a.textContent = text;
+  return a;
+}
+
+function renderCrumbs() {
+  const parts = projectId ? projectId.split("/") : [];
+  const crumbs = [link(projectUrl(""), "cases")];
+  parts.forEach((part, i) => {
+    crumbs.push(document.createTextNode(" / "), link(projectUrl(parts.slice(0, i + 1).join("/")), part));
+  });
+  $("crumbs").replaceChildren(...crumbs);
+  document.title = `${projectId || "cases"} · remote-ct-viewer`;
+}
+
+function renderProjects(ids) {
+  $("projects-section").hidden = ids.length === 0;
+  $("projects").replaceChildren(...ids.map((id) => link(projectUrl(id), id.split("/").pop())));
+}
+
+function caseRow(c) {
+  const tr = document.createElement("tr");
+  tr.innerHTML = `<td></td><td class="notes"></td><td class="when"></td><td class="flags"></td>`;
+  const [name, notes, when, flags] = tr.children;
+  const a = link(caseUrl(c.id), c.name);
+  a.target = "_blank";
+  name.append(a);
+  notes.textContent = c.notes;
+  when.textContent = c.updated ? new Date(c.updated).toLocaleString() : "";
+  flags.textContent = [c.has_mask ? "mask" : "", c.has_case_notes ? "notes.md" : ""].filter(Boolean).join(" · ");
+  tr.dataset.search = `${c.name}\n${c.notes}`.toLowerCase();
+  return tr;
+}
+
+function applyFilter() {
+  const q = $("filter").value.trim().toLowerCase();
+  for (const tr of $("rows").children) tr.hidden = q !== "" && !tr.dataset.search.includes(q);
+}
+
+renderCrumbs();
+const res = await fetch(`/api/projects/${idPath(projectId)}`);
+if (!res.ok) {
+  $("empty").textContent = `No project "${projectId}"`;
+} else {
+  const project = await res.json();
+  renderProjects(project.projects);
+  $("rows").replaceChildren(...project.cases.map(caseRow));
+  if (project.cases.length === 0) $("empty").textContent = "No cases directly in this project.";
+}
+$("filter").oninput = applyFilter;
+</script>
+</body>
+</html>
