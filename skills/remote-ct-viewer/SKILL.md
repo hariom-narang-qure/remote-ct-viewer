@@ -41,8 +41,18 @@ cases/
   - `<project>/project.json` is what the *user* wrote in the viewer's "My notes" dialog, keyed by the
     case's folder name (not its full id):
     ```json
-    { "cases": { "case1": { "notes": "fissure broken at apex", "updated": "2026-11-06T08:30:56+00:00" } } }
+    { "cases": { "case1": {
+        "notes": "fissure broken at apex",
+        "points": [{ "id": "k3j9x0aa", "view": "axial", "slice": 120, "slice_axis": 2,
+                     "voxel": [210, 188, 120], "mm": [-61.2, 14.0, -230.5],
+                     "note": "gap here", "created": "2026-11-06T10:00:00.000Z" }],
+        "updated": "2026-11-06T08:30:56+00:00" } } }
     ```
+    `points` are notes the user pinned to one spot on a slice. `view` is the pane they pointed in.
+    `voxel` uses the scan file's native index order, so `nib.load(scan).get_fdata()[i, j, k]` is the
+    pointed voxel, and `slice == voxel[slice_axis]`. `mm` is world RAS. When you analyse a point,
+    index the scan or mask with `voxel`; don't re-derive it from `slice`. To send the user to a
+    point, link `http://localhost:8000/#case=<case id>&point=<point id>`.
     Read it when the user refers to their notes, or asks which cases they flagged, accepted, rejected
     and so on. It is the record of the user's review, so don't edit it unless they ask. If you must
     write to it, keep every key you didn't add; other tools may store data there too.

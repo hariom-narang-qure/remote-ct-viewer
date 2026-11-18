@@ -13,7 +13,7 @@
   body { display: flex; }
   aside { width: 240px; flex: none; padding: 12px; background: var(--panel);
           border-right: 1px solid var(--line); overflow-y: auto; }
-  main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
   #viewer { flex: 1; min-height: 0; }
   #status { padding: 6px 12px; border-top: 1px solid var(--line); color: var(--muted);
             font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; }
@@ -71,6 +71,19 @@
   #notes-dialog h2 { margin: 0 0 8px; }
   #notes-text { width: 100%; height: 40vh; resize: vertical; background: #222; color: var(--text);
                 border: 1px solid var(--line); padding: 6px; font: 13px/1.4 system-ui, sans-serif; }
+  #add-point { width: 100%; }
+  .point-row { display: flex; align-items: flex-start; gap: 4px; padding: 3px 0; cursor: pointer; }
+  .point-row:hover .point-text { color: var(--text); }
+  .point-where { color: #f0d060; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .point-text { flex: 1; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .point-row button { padding: 0 5px; }
+  /* Drawn over the canvas; pointer-events off so clicks still reach NiiVue. */
+  #pins { position: absolute; left: 0; top: 0; overflow: hidden; pointer-events: none; }
+  .pin { position: absolute; display: flex; align-items: flex-start; gap: 4px; transform: translate(-6px, -6px); }
+  .pin-dot { width: 12px; height: 12px; flex: none; border: 2px solid #f0d060; border-radius: 50%;
+             box-shadow: 0 0 0 1px #000; }
+  .pin-text { max-width: 240px; padding: 1px 5px; background: rgba(0, 0, 0, .75); color: #f0d060;
+              font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; border-radius: 2px; }
   #notes-dialog footer { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; }
 </style>
 </head>
@@ -85,6 +98,10 @@
   <a id="project-link" target="_blank"></a>
   <button id="my-notes" title="Your notes on this case, saved in the project's project.json">My notes</button>
   <div id="my-notes-preview" class="muted"></div>
+
+  <h2>Point notes</h2>
+  <button id="add-point" title="Click a spot in a slice first; the note is pinned to that view and slice">Note at crosshair (N)</button>
+  <div id="points" class="muted"></div>
 
   <h2>View</h2>
   <div class="row" id="views">
@@ -151,11 +168,13 @@
   <div class="row" id="mask-actions" hidden>
     <button id="all">All</button><button id="none">None</button>
   </div>
+  <div id="mask-shortcut" class="muted" hidden>Ctrl+. toggles all</div>
   <h2>Opacity</h2>
   <input type="range" id="opacity" min="0" max="1" step="0.05" value="0.5">
 </aside>
 <main>
   <canvas id="viewer"></canvas>
+  <div id="pins"></div>
   <div id="status">&nbsp;</div>
 </main>
 <aside id="notes-panel" hidden>
@@ -176,7 +195,7 @@
 
 <script type="module">
 import { Niivue } from "https://unpkg.com/@niivue/niivue@0.57.0/dist/index.js";
-import { MaskEditor, freeMarkValue, nativeIndex } from "/static/mask-edit.js";
+import { MaskEditor, freeMarkValue, nativeAxisOfWorld, nativeCoords, nativeIndex } from "/static/mask-edit.js";
 import { marked } from "https://cdn.jsdelivr.net/npm/marked@12.0.2/lib/marked.esm.js";
 import DOMPurify from "https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.es.mjs";
 
@@ -263,6 +282,7 @@ async function set3d(on) {
   $("toggle-3d").classList.toggle("on", on);
   $("panel-2d").hidden = on;
   $("panel-3d").hidden = !on;
+  $("add-point").disabled = on;
   if (!on) setDeleteMode(false);
   applyScanDisplay();
 }
@@ -318,6 +338,7 @@ const displayName = (id) => {
 function renderMaskList() {
   const ids = Object.keys(labels).map(Number);
   $("mask-actions").hidden = ids.length === 0;
+  $("mask-shortcut").hidden = ids.length === 0;
   if (!hasMask()) { $("masks").textContent = "No mask"; return; }
   if (ids.length === 0) { $("masks").textContent = "Mask is empty"; return; }
   $("masks").replaceChildren(...ids.map((id) => {
@@ -333,6 +354,11 @@ function renderMaskList() {
     return row;
   }));
 }
+
+// Hides everything if anything is shown, so a half-visible set goes to none first: one press clears the view.
+const toggleAllMasks = () => setAllVisible(visible.size === 0);
+
+const isTyping = (el) => el.matches("input:not([type=checkbox]):not([type=range]), textarea, select");
 
 function setAllVisible(on) {
   visible = on ? new Set(Object.keys(labels).map(Number)) : new Set();
@@ -434,10 +460,12 @@ async function applyDelete() {
 // Ids are "/"-separated paths (project/sub/case); each segment is encoded, the slashes are kept.
 const idPath = (id) => id.split("/").map(encodeURIComponent).join("/");
 const caseUrl = (caseId) => `/#case=${encodeURIComponent(caseId)}`;
+const hashParam = (name) => new URLSearchParams(location.hash.slice(1)).get(name) ?? "";
 const projectUrl = (projectId) => `/projects/${projectId ? idPath(projectId) + "/" : ""}`;
 const fetchCase = (caseId) => fetch(`/api/cases/${idPath(caseId)}`);
 
-async function loadCase(caseId) {
+// pointId (from a "#case=..&point=.." link on the project page) is jumped to once the case is loaded.
+async function loadCase(caseId, pointId = "") {
   $("status").textContent = `Loading ${caseId}…`;
   const res = await fetchCase(caseId);
   if (!res.ok) { $("status").textContent = `No case "${caseId}"`; return; }
@@ -462,11 +490,15 @@ async function loadCase(caseId) {
   showNotes(c.notes);
   showProject(c.project);
   showUserNotes(c.user_notes.notes ?? "");
+  points = c.user_notes.points ?? [];
+  renderPoints();
   // replaceState, not location.hash, so this doesn't fire hashchange and reload the case.
   history.replaceState(null, "", caseUrl(caseId));
   document.title = `${caseId} · remote-ct-viewer`;
   $("case").value = caseId;
   $("status").textContent = caseId;
+  const point = points.find((p) => p.id === pointId);
+  if (point) goToPoint(point);
 }
 
 function createEditor() {
@@ -623,21 +655,29 @@ function showUserNotes(text) {
   $("my-notes-preview").textContent = text;
 }
 
-function openNotesDialog() {
-  $("notes-dialog-title").textContent = `My notes · ${currentCase}`;
-  $("notes-text").value = userNotes;
+// One dialog serves both the case notes and point notes; `onSave` is whatever the open one saves to.
+let dialogOnSave = null;
+function openTextDialog(title, text, onSave) {
+  dialogOnSave = onSave;
+  $("notes-dialog-title").textContent = title;
+  $("notes-text").value = text;
   $("notes-dialog-status").textContent = "Ctrl+Enter to save";
   $("notes-dialog").showModal();
   $("notes-text").focus();
 }
 
-async function saveUserNotes() {
-  const res = await fetch(`/api/user-notes/${idPath(currentCase)}`, {
-    method: "PUT", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ notes: $("notes-text").value }),
+const openNotesDialog = () => openTextDialog(`My notes · ${currentCase}`, userNotes, saveUserNotes);
+
+async function putJson(url, body) {
+  const res = await fetch(url, {
+    method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error((await res.json()).detail ?? res.statusText);
-  showUserNotes((await res.json()).notes);
+  if (!res.ok) throw new Error(JSON.stringify((await res.json()).detail ?? res.statusText));
+  return res.json();
+}
+
+async function saveUserNotes(text) {
+  showUserNotes((await putJson(`/api/user-notes/${idPath(currentCase)}`, { notes: text })).notes);
 }
 
 // The dialog only closes once the save went through, so a failed save never loses what was typed.
@@ -645,13 +685,151 @@ async function submitNotesDialog() {
   $("save-notes").disabled = true;
   $("notes-dialog-status").textContent = "Saving…";
   try {
-    await saveUserNotes();
+    await dialogOnSave($("notes-text").value);
     $("notes-dialog").close();
   } catch (err) {
     $("notes-dialog-status").textContent = `Save failed: ${err.message}`;
   } finally {
     $("save-notes").disabled = false;
   }
+}
+
+// ---- Point notes: a note pinned to one spot on one slice of one view (format documented in projects.py)
+
+// NiiVue numbers 2D views (its axCorSag) 0 = axial, 1 = coronal, 2 = sagittal.
+const VIEWS = ["axial", "coronal", "sagittal"];
+// World RAS axis each view looks along: axial slices step in z, coronal in y, sagittal in x.
+const VIEW_NORMAL = [2, 1, 0];
+// World RAS axes drawn across and up each view, in NiiVue's tile coordinates (tile.leftTopMM / fovMM).
+const VIEW_PLANE = [[0, 1], [0, 2], [1, 2]];
+const MPR = 3;
+
+let points = [];
+let lastPointedView = 0;  // the 2D pane last clicked or scrolled in, from onLocationChange
+
+const viewIndex = (point) => VIEWS.indexOf(point.view);
+const crosshairMM = () => Array.from(nv.frac2mm(nv.scene.crosshairPos, 0, true));
+const scanVoxelAt = (mm) => nativeCoords(scanVol, scanVol.mm2vox(mm));
+// A single-view layout leaves no doubt; in MPR it is whichever pane was used last.
+const currentView = () => (sliceType2d === MPR ? lastPointedView : sliceType2d);
+const newPointId = () => Math.random().toString(36).slice(2, 10);
+const round2 = (v) => Math.round(v * 100) / 100;
+
+function pointAtCrosshair() {
+  const view = currentView();
+  const mm = crosshairMM();
+  const voxel = scanVoxelAt(mm);
+  const sliceAxis = nativeAxisOfWorld(scanVol, VIEW_NORMAL[view]);
+  return {
+    id: newPointId(), view: VIEWS[view], slice: voxel[sliceAxis], slice_axis: sliceAxis,
+    // frac2mm returns a homogeneous vec4 (x, y, z, 1); the point stores the 3 world coordinates.
+    voxel, mm: mm.slice(0, 3).map(round2), note: "", created: new Date().toISOString(),
+  };
+}
+
+async function savePoints(list) {
+  points = (await putJson(`/api/point-notes/${idPath(currentCase)}`, { points: list })).points;
+  renderPoints();
+}
+
+function addPointNote() {
+  if (is3d || !scanVol || !currentCase) return;
+  const point = pointAtCrosshair();
+  openTextDialog(`Note · ${point.view} slice ${point.slice}`, "", async (text) => {
+    if (text.trim()) await savePoints([...points, { ...point, note: text }]);
+  });
+}
+
+function editPointNote(point) {
+  openTextDialog(`Note · ${point.view} slice ${point.slice}`, point.note, (text) =>
+    savePoints(points.map((p) => (p.id === point.id ? { ...p, note: text } : p))));
+}
+
+async function deletePointNote(point) {
+  if (!confirm(`Delete the note on ${point.view} slice ${point.slice}?`)) return;
+  try { await savePoints(points.filter((p) => p.id !== point.id)); }
+  catch (err) { $("status").textContent = `Delete failed: ${err.message}`; }
+}
+
+// Leaves 3D and, if the layout doesn't show the point's view, switches to that view alone.
+async function goToPoint(point) {
+  const view = viewIndex(point);
+  if (sliceType2d !== MPR && sliceType2d !== view) $("views").children[view].click();
+  if (is3d) await set3d(false);
+  nv.scene.crosshairPos = nv.mm2frac(point.mm, 0, true);  // same "true" as crosshairMM, so it round-trips
+  lastPointedView = view;
+  nv.updateGLVolume();
+  nv.createOnLocationChange(view);
+}
+
+function renderPoints() {
+  if (points.length === 0) { $("points").textContent = "None yet"; return; }
+  $("points").replaceChildren(...points.map((point) => {
+    const row = document.createElement("div");
+    row.className = "point-row";
+    row.title = "Go to this point";
+    row.innerHTML = `<span class="point-where"></span><span class="point-text"></span>
+      <button title="Edit">✎</button><button title="Delete">×</button>`;
+    row.children[0].textContent = `${point.view[0].toUpperCase()} ${point.slice}`;
+    row.children[1].textContent = point.note;
+    row.onclick = () => goToPoint(point);
+    row.children[2].onclick = (e) => { e.stopPropagation(); editPointNote(point); };
+    row.children[3].onclick = (e) => { e.stopPropagation(); deletePointNote(point); };
+    return row;
+  }));
+}
+
+// Same mapping NiiVue uses to draw its crosshair lines (mm2screen in drawCrossLinesMM). A negative tile
+// width means the view is mirrored (radiological convention), and the formula handles that as is.
+// Returns CSS pixels, or null if the spot is panned or zoomed out of the tile.
+function tileToCss(tile, [mmAcross, mmUp]) {
+  const [left, top, w, h] = tile.leftTopWidthHeight;
+  const fx = (mmAcross - tile.leftTopMM[0]) / tile.fovMM[0];
+  const fy = (mmUp - tile.leftTopMM[1]) / tile.fovMM[1];
+  if (fx < 0 || fx > 1 || fy < 0 || fy > 1) return null;
+  const dpr = nv.uiData.dpr;
+  return [(left + fx * w) / dpr, (top + h - fy * h) / dpr];
+}
+
+// A point shows in tiles of its own view, and only while that view is on the point's slice.
+function pinPlacements() {
+  if (is3d || !scanVol || points.length === 0) return [];
+  const here = scanVoxelAt(crosshairMM());
+  const placements = [];
+  for (const point of points) {
+    if (here[point.slice_axis] !== point.slice) continue;
+    const view = viewIndex(point);
+    for (const tile of nv.screenSlices) {
+      if (tile.axCorSag !== view || !tile.leftTopMM?.length) continue;
+      const xy = tileToCss(tile, VIEW_PLANE[view].map((axis) => point.mm[axis]));
+      if (xy) placements.push({ point, xy });
+    }
+  }
+  return placements;
+}
+
+// NiiVue has no after-draw hook, so the pins follow it by checking every frame. The DOM is only
+// touched when something moved, so an idle frame costs a few arithmetic ops per point.
+let lastPinsKey = "";
+function drawPins() {
+  const canvas = $("viewer");
+  const placements = pinPlacements();
+  const key = `${canvas.clientWidth}x${canvas.clientHeight}|` +
+    placements.map(({ point, xy }) => `${point.id}:${point.note}:${xy.map(Math.round)}`).join("|");
+  if (key !== lastPinsKey) {
+    lastPinsKey = key;
+    Object.assign($("pins").style, { width: `${canvas.clientWidth}px`, height: `${canvas.clientHeight}px` });
+    $("pins").replaceChildren(...placements.map(({ point, xy }) => {
+      const pin = document.createElement("div");
+      pin.className = "pin";
+      pin.style.left = `${xy[0]}px`;
+      pin.style.top = `${xy[1]}px`;
+      pin.innerHTML = `<span class="pin-dot"></span><span class="pin-text"></span>`;
+      pin.lastElementChild.textContent = point.note;
+      return pin;
+    }));
+  }
+  requestAnimationFrame(drawPins);
 }
 
 // Pasted names often carry quotes or backticks from chat; strip them.
@@ -668,7 +846,7 @@ async function openCaseInNewTab() {
   window.open(caseUrl(caseId), "_blank");
 }
 
-const caseFromHash = () => new URLSearchParams(location.hash.slice(1)).get("case") ?? "";
+const caseFromHash = () => hashParam("case");
 
 // Looked up by volume id because the scan is missing from the values while hidden in 3D.
 function describeLocation(data) {
@@ -681,7 +859,10 @@ function describeLocation(data) {
   return parts.join("  ·  ");
 }
 
-nv.onLocationChange = (data) => { $("status").textContent = describeLocation(data); };
+nv.onLocationChange = (data) => {
+  $("status").textContent = describeLocation(data);
+  if (data.axCorSag >= 0 && data.axCorSag <= 2) lastPointedView = data.axCorSag;  // NaN when not from a pane
+};
 
 // Capture phase on window runs before NiiVue's canvas listener picks. Parking the crosshair outside the
 // volume (fractions run 0..1) tells a miss apart from re-picking the same point, which leaves it unmoved.
@@ -696,7 +877,7 @@ $("viewer").addEventListener("dblclick", () => { if (is3d && deleteMode) toggleM
 
 $("case").onchange = (e) => loadCase(e.target.value);
 $("open").onkeydown = (e) => { if (e.key === "Enter") openCaseInNewTab(); };
-window.onhashchange = () => { if (caseFromHash()) loadCase(caseFromHash()); };
+window.onhashchange = () => { if (caseFromHash()) loadCase(caseFromHash(), hashParam("point")); };
 $("window").onchange = applyScanDisplay;
 $("render-preset").onchange = applyScanDisplay;
 $("show-scan-3d").onchange = applyScanDisplay;
@@ -729,6 +910,17 @@ window.addEventListener("keydown", (e) => {
   if (e.key === "b" && !e.ctrlKey && !e.metaKey) setBoxMode(!boxMode);
   if (e.key === "z" && (e.ctrlKey || e.metaKey) && boxMode) { e.preventDefault(); undoBox(); }
 });
+window.addEventListener("keydown", (e) => {
+  if (isTyping(e.target) || $("notes-dialog").open) return;
+  if (e.key === "." && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault();
+    if (hasMask()) toggleAllMasks();
+  } else if (e.key.toLowerCase() === "n" && !(e.ctrlKey || e.metaKey || e.altKey)) {
+    e.preventDefault();
+    addPointNote();
+  }
+});
+$("add-point").onclick = addPointNote;
 $("all").onclick = () => setAllVisible(true);
 $("none").onclick = () => setAllVisible(false);
 for (const btn of $("views").children) {
@@ -740,10 +932,12 @@ for (const btn of $("views").children) {
   };
 }
 
+requestAnimationFrame(drawPins);
+
 const cases = await (await fetch("/api/cases")).json();
 $("case").replaceChildren(...cases.map((id) => new Option(id, id)));
 const initial = caseFromHash() || cases[0];
-if (initial) await loadCase(initial);
+if (initial) await loadCase(initial, hashParam("point"));
 else $("status").textContent = "No cases found. Add folders with scan.nii.gz under the cases directory.";
 </script>
 </body>

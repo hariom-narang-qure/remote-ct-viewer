@@ -18,7 +18,7 @@ Files are looked up by a fixed allowlist of names inside a case folder. Case ids
 segment (case_layout.path_for), so requests cannot escape the cases directory.
 
 There are three write paths:
-- The reviewer's per-case notes, saved into the project's project.json (projects.py).
+- The reviewer's per-case notes and point notes, saved into the project's project.json (projects.py).
 - The box tool's predictions, saved as box-prompt.nii.gz in the case folder (box_prompt.py).
 - Edited masks (3D delete mode). The browser posts the whole edited mask as .nii.gz and the server
   saves it as a new case "<case>-edit<n>" in the same project, never touching the original:
@@ -41,7 +41,9 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field
 
 import projects
 import box_prompt
@@ -153,9 +155,34 @@ class UserNotes(BaseModel):
     notes: str
 
 
+# Field meanings are documented in projects.py. Unknown fields are kept, not dropped.
+class PointNote(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    id: str
+    view: Literal["axial", "coronal", "sagittal"]
+    slice: int
+    slice_axis: int = Field(ge=0, le=2)
+    voxel: list[int] = Field(min_length=3, max_length=3)
+    mm: list[float] = Field(min_length=3, max_length=3)
+    note: str
+    created: str
+
+
+class PointNotes(BaseModel):
+    points: list[PointNote]
+
+
 @app.put("/api/user-notes/{case_id:path}")
 def put_user_notes(case_id: str, body: UserNotes):
-    return projects.save_case_notes(case_dir(case_id), body.notes)
+    return projects.update_case_entry(case_dir(case_id), notes=body.notes)
+
+
+# The page holds the case's whole list and sends it back after each add, edit or delete. Only one
+# reviewer edits a case at a time, so whole-list replacement is simpler than per-point endpoints.
+@app.put("/api/point-notes/{case_id:path}")
+def put_point_notes(case_id: str, body: PointNotes):
+    points = [p.model_dump() for p in body.points]
+    return projects.update_case_entry(case_dir(case_id), points=points)
 
 
 @app.get("/files/{case_id:path}/{name}")

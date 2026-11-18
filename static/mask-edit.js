@@ -124,6 +124,12 @@ export function freeMarkValue(img, labelIds) {
 
 // Mirrors NiiVue's NVImage getValue: RAS voxel -> native voxel via toRASvox, then rounded and clamped.
 export function nativeIndex(volume, rasVox) {
+  const [x, y, z] = nativeCoords(volume, rasVox);
+  const [nx, ny] = volume.hdr.dims.slice(1, 3);
+  return x + y * nx + z * nx * ny;
+}
+
+export function nativeCoords(volume, rasVox) {
   let [x, y, z] = rasVox;
   const perm = volume.permRAS;
   if (perm[0] !== 1 || perm[1] !== 2 || perm[2] !== 3) {
@@ -136,5 +142,8 @@ export function nativeIndex(volume, rasVox) {
   }
   const [nx, ny, nz] = volume.hdr.dims.slice(1, 4);
   const clamp = (v, n) => Math.max(0, Math.min(Math.round(v), n - 1));
-  return clamp(x, nx) + clamp(y, ny) * nx + clamp(z, nz) * nx * ny;
+  return [clamp(x, nx), clamp(y, ny), clamp(z, nz)];
 }
+
+// permRAS[w] is the native axis (1-based, negative if flipped) that NiiVue lines up with world axis w.
+export const nativeAxisOfWorld = (volume, worldAxis) => Math.abs(volume.permRAS[worldAxis]) - 1;
