@@ -17,8 +17,9 @@ Volumes are rendered entirely in the browser; this server only lists cases and s
 Files are looked up by a fixed allowlist of names inside a case folder. Case ids are checked segment by
 segment (case_layout.path_for), so requests cannot escape the cases directory.
 
-There are two write paths:
+There are three write paths:
 - The reviewer's per-case notes, saved into the project's project.json (projects.py).
+- The box tool's predictions, saved as box-prompt.nii.gz in the case folder (box_prompt.py).
 - Edited masks (3D delete mode). The browser posts the whole edited mask as .nii.gz and the server
   saves it as a new case "<case>-edit<n>" in the same project, never touching the original:
   1. The upload must have the original mask's shape and may only differ from it by voxels set to 0,
@@ -43,10 +44,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import projects
-from case_layout import CASES_DIR, MASK_FILE, META_FILE, NOTES_FILE, SCAN_FILE, id_of, is_case, path_for, project_id_of
+import box_prompt
+from case_layout import BOX_PROMPT_FILE, CASES_DIR, MASK_FILE, META_FILE, NOTES_FILE, SCAN_FILE, id_of, is_case, path_for, project_id_of
 
 HERE = Path(__file__).parent
-SERVABLE_FILES = {SCAN_FILE, MASK_FILE}
+SERVABLE_FILES = {SCAN_FILE, MASK_FILE, BOX_PROMPT_FILE}
 
 app = FastAPI(title="remote-ct-viewer")
 app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
@@ -118,7 +120,33 @@ def get_case(case_id: str):
         "labels": read_label_names(path) if has_mask else {},
         "notes": read_notes(path),
         "user_notes": projects.case_entry(path),
+        "box_prompt": box_prompt_url(case_id, path),
     }
+
+
+def box_prompt_url(case_id: str, path: Path) -> str | None:
+    return f"/files/{case_id}/{BOX_PROMPT_FILE}" if (path / BOX_PROMPT_FILE).is_file() else None
+
+
+@app.get("/api/box-prompt-status")
+def box_prompt_status():
+    return {"url": box_prompt.SERVICE_URL, "up": box_prompt.service_is_up()}
+
+
+@app.post("/api/box-prompt/{case_id:path}")
+async def add_box(case_id: str, body: box_prompt.BoxRequest):
+    path = case_dir(case_id)
+    return await run_in_threadpool(box_prompt.add_box, path, body)
+
+
+@app.post("/api/box-prompt-undo/{case_id:path}")
+def undo_box(case_id: str):
+    return box_prompt.undo_last(case_dir(case_id))
+
+
+@app.delete("/api/box-prompt/{case_id:path}")
+def clear_boxes(case_id: str):
+    return box_prompt.clear(case_dir(case_id))
 
 
 class UserNotes(BaseModel):
