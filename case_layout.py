@@ -19,6 +19,7 @@ MASK_FILE = "mask.nii.gz"
 META_FILE = "mask-meta.json"
 NOTES_FILE = "notes.md"
 PROJECT_FILE = "project.json"
+BOX_PROMPT_FILE = "box-prompt.nii.gz"   # sheets painted with the box tool, one label per box
 
 SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 

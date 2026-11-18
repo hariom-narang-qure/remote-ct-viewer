@@ -32,6 +32,9 @@
   .swatch { width: 12px; height: 12px; border-radius: 2px; flex: none; }
   .muted { color: var(--muted); }
   #toggle-3d { width: 100%; margin-top: 6px; }
+  #box-mode { width: 100%; }
+  #box-mode.on { background: #4a3b1f; border-color: #c8a04a; }
+  #box-status.error { color: #e66; }
   #toggle-3d.on, #delete-mode.on { background: #2d4459; border-color: #5b8db8; }
   #delete-mode { width: 100%; }
   .mark-row { display: flex; align-items: center; gap: 6px; padding: 2px 0; }
@@ -101,6 +104,17 @@
       <option value="-500,1300">Bone (W1800 L400)</option>
     </select>
     <div class="muted">Right-drag to adjust.</div>
+
+    <h2>Box tool</h2>
+    <button id="box-mode" title="Right-drag a box on a slice; the fissure model paints the sheet inside it">Draw boxes (B)</button>
+    <div id="box-help" class="muted" hidden>
+      Right-drag a box around one fissure on an axial, coronal or sagittal slice. The model paints that sheet
+      on 15 slices (8 before this one to 6 after). Scroll on, draw the next box. Window adjust is off meanwhile.
+    </div>
+    <div class="row" id="box-actions" hidden>
+      <button id="box-undo" title="Ctrl+Z">Undo box</button><button id="box-clear">Clear all</button>
+    </div>
+    <div id="box-status" class="muted"></div>
   </div>
 
   <div id="panel-3d" hidden>
@@ -200,6 +214,9 @@ let scanVol = null, maskVol = null;
 let currentCase = "";
 let editor = null;  // MaskEditor for the loaded mask; null without a mask
 let deleteMode = false;
+let boxMode = false;
+let boxVol = null;      // box-prompt.nii.gz of the case, one label per box; null until the first box
+let boxBusy = false;
 
 const colorFor = (id) => PALETTE[(id - 1) % PALETTE.length];
 const rgb = ([r, g, b]) => `rgb(${r},${g},${b})`;
@@ -428,6 +445,7 @@ async function loadCase(caseId) {
   const [calMin, calMax] = windowRange();
   const volumes = [{ url: c.scan, colormap: "gray", cal_min: calMin, cal_max: calMax }];
   if (c.mask) volumes.push({ url: c.mask, opacity: Number($("opacity").value) });
+  boxVol = null;  // loadVolumes replaces every volume, the box overlay included
   await nv.loadVolumes(volumes);
   [scanVol, maskVol = null] = nv.volumes;
   currentCase = caseId;
@@ -440,6 +458,7 @@ async function loadCase(caseId) {
   renderMaskList();
   renderMarks();
   refreshMask();
+  await loadBoxOverlay(c.box_prompt);
   showNotes(c.notes);
   showProject(c.project);
   showUserNotes(c.user_notes.notes ?? "");
@@ -455,6 +474,125 @@ function createEditor() {
   const markValue = freeMarkValue(maskVol.img, Object.keys(labels).map(Number));
   return markValue === null ? null : new MaskEditor(maskVol, markValue);
 }
+
+// NiiVue's axCorSag tile ids.
+const BOX_PLANES = { 0: "axial", 1: "coronal", 2: "sagittal" };
+const BOX_COLORS = [[255, 200, 0], [0, 220, 255], [255, 90, 200], [120, 255, 90], [255, 140, 40], [170, 130, 255]];
+
+function boxLut(maxLabel) {
+  const lut = { R: [0], G: [0], B: [0], A: [0], I: [0], labels: [""] };
+  for (let id = 1; id <= maxLabel; id++) {
+    const [r, g, b] = BOX_COLORS[(id - 1) % BOX_COLORS.length];
+    lut.R.push(r); lut.G.push(g); lut.B.push(b); lut.A.push(255); lut.I.push(id); lut.labels.push(`box ${id}`);
+  }
+  return lut;
+}
+
+const maxLabelIn = (img) => img.reduce((m, v) => (v > m ? v : m), 0);
+let boxCount = 0;   // the highest box label; boxes are numbered 1, 2, ... in drawing order
+
+function showBoxCount(count) {
+  boxCount = count;
+  if (boxVol) boxVol.setColormapLabel(boxLut(Math.max(count, 1)));
+  $("box-actions").hidden = count === 0;
+  nv.updateGLVolume();
+}
+
+// The file is loaded with the case and after the first box. Later boxes are painted into the loaded
+// overlay from the voxel indices the server returns, since reloading a 100M-voxel file per box is slow.
+async function loadBoxOverlay(url) {
+  if (boxVol) { nv.removeVolume(boxVol); boxVol = null; }
+  if (url) boxVol = await nv.addVolumeFromUrl({ url: `${url}?v=${Date.now()}`, name: "box-prompt.nii.gz", opacity: 0.7 });
+  showBoxCount(boxVol ? maxLabelIn(boxVol.img) : 0);
+}
+
+async function paintBox(label, indices) {
+  if (!boxVol) { await reloadBoxes(); return; }
+  for (const i of indices) boxVol.img[i] = label;
+  showBoxCount(label);
+}
+
+function eraseBox(label) {
+  const img = boxVol.img;
+  for (let i = 0; i < img.length; i++) if (img[i] === label) img[i] = 0;
+  showBoxCount(label - 1);
+}
+
+function setBoxStatus(text, isError = false) {
+  $("box-status").textContent = text;
+  $("box-status").classList.toggle("error", isError);
+}
+
+// Right-drag normally adjusts the window. In box mode NiiVue only draws the rectangle and calls back.
+function setBoxMode(on) {
+  boxMode = on;
+  nv.opts.dragMode = on ? nv.dragModes.callbackOnly : nv.dragModes.contrast;
+  $("box-mode").classList.toggle("on", on);
+  $("box-help").hidden = !on;
+  if (on) checkBoxService();
+}
+
+async function checkBoxService() {
+  const status = await (await fetch("/api/box-prompt-status")).json();
+  if (!status.up) setBoxStatus(`Box service is not running at ${status.url}`, true);
+}
+
+async function boxRequest(method, path, body) {
+  const res = await fetch(`${path}/${idPath(currentCase)}`, {
+    method, headers: { "content-type": "application/json" }, body: body && JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error((await res.json()).detail ?? res.statusText);
+  return res.json();
+}
+
+async function reloadBoxes() {
+  const c = await (await fetchCase(currentCase)).json();
+  return loadBoxOverlay(c.box_prompt);
+}
+
+async function runBoxAction(label, action) {
+  if (boxBusy) return;
+  boxBusy = true;
+  setBoxStatus(label);
+  const started = performance.now();
+  try {
+    const message = await action();
+    setBoxStatus(`${message} (${((performance.now() - started) / 1000).toFixed(1)} s)`);
+  } catch (err) {
+    setBoxStatus(err.message, true);
+  } finally {
+    boxBusy = false;
+  }
+}
+
+function predictBox(info) {
+  const plane = BOX_PLANES[info.axCorSag];
+  if (!plane) { setBoxStatus("Draw the box inside one slice view", true); return; }
+  if (info.mmLength < 2) return;  // a click, not a box
+  runBoxAction(`Painting the sheet in the ${plane} box…`, async () => {
+    const result = await boxRequest("POST", "/api/box-prompt",
+      { plane, mm_start: Array.from(info.mmStart).slice(0, 3), mm_end: Array.from(info.mmEnd).slice(0, 3) });
+    await paintBox(result.label, result.indices);
+    return result.voxels ? `Box ${result.label}: ${result.voxels.toLocaleString()} voxels` : `Box ${result.label}: nothing painted`;
+  });
+}
+
+const undoBox = () => runBoxAction("Undoing…", async () => {
+  const result = await boxRequest("POST", "/api/box-prompt-undo");
+  if (result.label && boxVol) eraseBox(result.label);
+  return result.label ? `Removed box ${result.label}` : "No box to undo";
+});
+
+const clearBoxes = () => {
+  if (!confirm("Remove every painted box of this case?")) return;
+  runBoxAction("Clearing…", async () => {
+    await boxRequest("DELETE", "/api/box-prompt");
+    await loadBoxOverlay(null);
+    return "Cleared";
+  });
+};
+
+nv.onDragRelease = (info) => { if (boxMode && !is3d) predictBox(info); };
 
 // Notes are arbitrary text from the case folder, rendered as HTML, so they are sanitised: without it a
 // note could run script in the page.
@@ -583,6 +721,14 @@ $("notes-dialog").addEventListener("submit", (e) => {
 $("notes-text").onkeydown = (e) => {
   if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submitNotesDialog(); }
 };
+$("box-mode").onclick = () => setBoxMode(!boxMode);
+$("box-undo").onclick = undoBox;
+$("box-clear").onclick = clearBoxes;
+window.addEventListener("keydown", (e) => {
+  if (e.target.closest("input, textarea, select, dialog")) return;
+  if (e.key === "b" && !e.ctrlKey && !e.metaKey) setBoxMode(!boxMode);
+  if (e.key === "z" && (e.ctrlKey || e.metaKey) && boxMode) { e.preventDefault(); undoBox(); }
+});
 $("all").onclick = () => setAllVisible(true);
 $("none").onclick = () => setAllVisible(false);
 for (const btn of $("views").children) {
