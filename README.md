@@ -47,7 +47,20 @@ notes on the open case; they are saved in the project's `project.json`:
 { "cases": { "case1": { "notes": "fissure broken at apex", "updated": "2026-11-06T08:30:56+00:00" } } }
 ```
 
-These are separate from `notes.md`, so re-dumping a case never wipes what you wrote. Other keys in
+These are separate from `notes.md`, so re-dumping a case never wipes what you wrote.
+
+**Point notes** pin a note to one spot. Click the spot in a slice, press N (or "Note at crosshair"), and
+type the note. It is stored under the case's `points` in `project.json` with the view you pointed in,
+the slice number, the voxel and the mm position:
+
+```json
+{ "id": "k3j9x0aa", "view": "axial", "slice": 120, "slice_axis": 2, "voxel": [210, 188, 120],
+  "mm": [-61.2, 14.0, -230.5], "note": "fissure gap here", "created": "2026-11-06T10:00:00.000Z" }
+```
+
+`voxel` is in the scan file's own index order (`nib.load(scan).get_fdata()[i, j, k]`), and
+`slice == voxel[slice_axis]`. The note is drawn on the scan whenever that view is on that slice. Click
+a point in the sidebar to jump to it; the project page lists the points and links straight to each one. Other keys in
 `project.json` are preserved, so tools can store more interaction data there.
 
 `dump_case.py` writes a case from NIfTI, `.npy`, DICOM folders or anything SimpleITK reads,
@@ -69,6 +82,7 @@ ssh -L 8000:localhost:8000 <user>@<remote>       # on your laptop, then open htt
 Paste a case name into the "Open case" box and press Enter to open it in a new tab.
 Links like `http://localhost:8000/#case=<case_id>` open a specific case.
 In the viewer, scroll to change slices, right-drag to adjust window/level, and click to read HU and the label.
+Ctrl+. (Cmd+. on macOS) toggles all masks: it hides them if any are shown, otherwise shows them all.
 The "3D render" button toggles a volume render of the masks. Tick "Show scan" to render the CT around
 them too (bone, skin or soft tissue preset, adjustable opacity); it is off by default because it is slower.
 

@@ -22,7 +22,11 @@
   table { border-collapse: collapse; width: 100%; }
   th, td { border-bottom: 1px solid var(--line); padding: 6px 8px; text-align: left; vertical-align: top; }
   th { color: var(--muted); font-weight: normal; position: sticky; top: 0; background: var(--bg); }
-  td.notes { white-space: pre-wrap; overflow-wrap: anywhere; width: 60%; }
+  td.notes { white-space: pre-wrap; overflow-wrap: anywhere; width: 35%; }
+  td.points { width: 35%; }
+  td.points a { display: block; text-decoration: none; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text); }
+  td.points a:hover { color: var(--link); }
+  .where { color: #f0d060; font-variant-numeric: tabular-nums; margin-right: 6px; }
   td.when, td.flags { white-space: nowrap; color: var(--muted); font-variant-numeric: tabular-nums; }
 </style>
 </head>
@@ -33,10 +37,10 @@
   <div id="projects"></div>
 </div>
 <h2>Cases</h2>
-<input id="filter" placeholder="Filter by case name or notes" autocomplete="off">
+<input id="filter" placeholder="Filter by case name, notes or point notes" autocomplete="off">
 <div class="table-wrap">
   <table>
-    <thead><tr><th>Case</th><th>My notes</th><th>Updated</th><th></th></tr></thead>
+    <thead><tr><th>Case</th><th>My notes</th><th>Point notes</th><th>Updated</th><th></th></tr></thead>
     <tbody id="rows"></tbody>
   </table>
 </div>
@@ -50,6 +54,7 @@ const projectId = decodeURIComponent(location.pathname.replace(/^\/projects\/?/,
 const idPath = (id) => id.split("/").map(encodeURIComponent).join("/");
 const projectUrl = (id) => `/projects/${id ? idPath(id) + "/" : ""}`;
 const caseUrl = (id) => `/#case=${encodeURIComponent(id)}`;
+const pointUrl = (caseId, pointId) => `${caseUrl(caseId)}&point=${encodeURIComponent(pointId)}`;
 
 function link(href, text) {
   const a = document.createElement("a");
@@ -73,17 +78,29 @@ function renderProjects(ids) {
   $("projects").replaceChildren(...ids.map((id) => link(projectUrl(id), id.split("/").pop())));
 }
 
+function pointLink(caseId, point) {
+  const a = link(pointUrl(caseId, point.id), point.note);
+  a.target = "_blank";
+  a.title = `Open at ${point.view} slice ${point.slice}, voxel ${point.voxel.join(", ")}`;
+  const where = document.createElement("span");
+  where.className = "where";
+  where.textContent = `${point.view} ${point.slice}`;
+  a.prepend(where);
+  return a;
+}
+
 function caseRow(c) {
   const tr = document.createElement("tr");
-  tr.innerHTML = `<td></td><td class="notes"></td><td class="when"></td><td class="flags"></td>`;
-  const [name, notes, when, flags] = tr.children;
+  tr.innerHTML = `<td></td><td class="notes"></td><td class="points"></td><td class="when"></td><td class="flags"></td>`;
+  const [name, notes, pointsCell, when, flags] = tr.children;
+  pointsCell.append(...c.points.map((p) => pointLink(c.id, p)));
   const a = link(caseUrl(c.id), c.name);
   a.target = "_blank";
   name.append(a);
   notes.textContent = c.notes;
   when.textContent = c.updated ? new Date(c.updated).toLocaleString() : "";
   flags.textContent = [c.has_mask ? "mask" : "", c.has_case_notes ? "notes.md" : ""].filter(Boolean).join(" · ");
-  tr.dataset.search = `${c.name}\n${c.notes}`.toLowerCase();
+  tr.dataset.search = [c.name, c.notes, ...c.points.map((p) => p.note)].join("\n").toLowerCase();
   return tr;
 }
 

@@ -2,7 +2,20 @@
 
 project.json sits in the project folder, next to its cases:
 
-    {"cases": {"<case folder name>": {"notes": "free text", "updated": "2026-11-06T10:00:00+00:00"}}}
+    {"cases": {"<case folder name>": {
+        "notes": "free text",
+        "points": [{"id": "p1a2b3", "view": "axial", "slice": 120, "slice_axis": 2,
+                    "voxel": [210, 188, 120], "mm": [-61.2, 14.0, -230.5],
+                    "note": "fissure gap here", "created": "2026-11-06T10:00:00+00:00"}],
+        "updated": "2026-11-06T10:00:00+00:00"}}}
+
+Points are notes pinned to a spot on a slice:
+  - view: the 2D view the user pointed in (axial, coronal or sagittal).
+  - voxel: the spot in the scan's native voxel indices, i.e. file order, so `scan.get_fdata()[i, j, k]`
+    in nibabel is the pointed voxel.
+  - slice / slice_axis: voxel[slice_axis], where slice_axis is the native axis closest to the view's
+    normal. For a usual axial CT and view "axial" that is the k in `scan[:, :, k]`.
+  - mm: the spot in world RAS millimetres, which stays valid even if the scan is resampled.
 
 Cases are keyed by folder name, not full id, so a project folder can be moved or renamed without
 rewriting its file. Keys this code doesn't know (in the file or per case) are kept on write, so other
@@ -46,12 +59,15 @@ def case_entry(case_dir: Path) -> dict:
     return read_project_file(case_dir.parent)["cases"].get(case_dir.name, {})
 
 
-def save_case_notes(case_dir: Path, notes: str) -> dict:
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def update_case_entry(case_dir: Path, **fields) -> dict:
     with _write_lock:
         data = read_project_file(case_dir.parent)
         entry = data["cases"].setdefault(case_dir.name, {})
-        entry["notes"] = notes
-        entry["updated"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        entry.update(fields, updated=now_iso())
         write_project_file(case_dir.parent, data)
         return entry
 
@@ -77,6 +93,7 @@ def describe_case_row(case_dir: Path, entry: dict) -> dict:
         "has_mask": (case_dir / MASK_FILE).is_file(),
         "has_case_notes": (case_dir / NOTES_FILE).is_file(),
         "notes": entry.get("notes", ""),
+        "points": entry.get("points", []),
         "updated": entry.get("updated"),
     }
 
